@@ -66,3 +66,30 @@ CREATE TABLE IF NOT EXISTS occupations (
 
 CREATE INDEX IF NOT EXISTS idx_occupations_session
     ON occupations (session_id);
+
+-- 实测频点批次：现场对某场次一次完整实测的留档（提交后不可变）。
+-- 批次号在场次内递增；内容指纹用于同批次重试的幂等判定与内容冲突拒绝；
+-- occupation_snapshot 固化提交时的当前占用，后续撤销占用不改变历史核对结果。
+CREATE TABLE IF NOT EXISTS measurements (
+    id                  SERIAL PRIMARY KEY,
+    session_id          INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    batch_no            INTEGER NOT NULL,        -- 场次内递增批次号（>=1）
+    plan_version        INTEGER NOT NULL,        -- 核对所依据的指定发布版号
+    content_fingerprint JSONB NOT NULL,          -- 提交内容指纹（批次幂等/冲突判定）
+    occupation_snapshot JSONB NOT NULL,          -- 提交时的当前占用快照（判定依据固化）
+    result              JSONB NOT NULL,          -- 固化的核对结果
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (batch_no >= 1),
+    UNIQUE (session_id, batch_no)
+);
+
+-- 批次内每个设备组的实测整数频点（即使不在场次可用集合内也如实留存）
+CREATE TABLE IF NOT EXISTS measurement_readings (
+    measurement_id INTEGER NOT NULL REFERENCES measurements(id) ON DELETE CASCADE,
+    group_id       INTEGER NOT NULL,
+    frequency      INTEGER NOT NULL,
+    PRIMARY KEY (measurement_id, group_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_measurements_session
+    ON measurements (session_id, batch_no);

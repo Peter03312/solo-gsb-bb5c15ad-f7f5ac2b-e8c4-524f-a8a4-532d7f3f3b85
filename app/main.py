@@ -4,11 +4,14 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
+from psycopg2.extras import Json
 
 from . import db
-from .schemas import (GroupCreate, InterferenceCreate, OccupationCreate,
-                      PlanCreate, RetuneRequest, SessionCreate)
+from .measurement import analyze_measurement
+from .schemas import (GroupCreate, InterferenceCreate, MeasurementCreate,
+                      OccupationCreate, PlanCreate, RetuneRequest,
+                      SessionCreate)
 from .solver import (FrequencySolver, SolverLimitExceeded, analyze_unsat,
                      build_forbidden, intervals_overlap)
 from .retune import RetunePlanner, RetuneLimitExceeded
@@ -24,10 +27,10 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="频点协调服务",
-    version="1.1.0",
+    version="1.2.0",
     description="为临时演出的无线电设备组协调频点：录入场次、设备组时段与"
                 "干扰关系，登记/撤销外部设备频点占用，按约束规划并发布不可"
-                "变的频点分配版本。",
+                "变的频点分配版本，并可留存现场实测频点批次、固化核对差异。",
     lifespan=lifespan,
 )
 
@@ -634,3 +637,209 @@ def plan_retune(session_id: int, payload: RetuneRequest,
         "target_assignment": _assignment_list(target),
         "steps": steps,
     }
+
+
+# --------------------------------------------------------------------- #
+# 现场实测频点批次（留存一次完整实测并核对差异；提交后不可变）
+# --------------------------------------------------------------------- #
+def _measurement_error(status_code: int, code: str, message: str, **extra):
+    detail = {"error": code, "message": message, **extra}
+    return HTTPException(status_code=status_code, detail=detail)
+
+
+def _measurement_public(row: dict) -> dict:
+    """组装批次的对外响应：固化结果 + 批次元数据 + 占用快照。"""
+    result = dict(row["result"])
+    result.update({
+        "id": row["id"],
+        "session_id": row["session_id"],
+        "batch_no": row["batch_no"],
+        "plan_version": row["plan_version"],
+        "created_at": row["created_at"],
+        "occupation_snapshot": row["occupation_snapshot"],
+    })
+    return result
+
+
+def _load_measurement(conn, session_id: int, batch_no: int):
+    """读取已固化的批次行；不存在返回 None。"""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, session_id, batch_no, plan_version, result, "
+            "content_fingerprint, occupation_snapshot, created_at "
+            "FROM measurements WHERE session_id = %s AND batch_no = %s",
+            (session_id, batch_no))
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {"id": row[0], "session_id": row[1], "batch_no": row[2],
+            "plan_version": row[3], "result": row[4],
+            "content_fingerprint": row[5], "occupation_snapshot": row[6],
+            "created_at": row[7]}
+
+
+@app.post("/sessions/{session_id}/measurements", status_code=201)
+def submit_measurement(session_id: int, payload: MeasurementCreate,
+                       response: Response, conn=Depends(db.get_conn)):
+    """留存某场次一次完整实测频点，并核对其与指定发布版及当前约束的差异。
+
+    - 组集合必须与指定发布版及场次当前组集合一致：未知发布版、漏组、重复组
+      或引用未知组一律拒绝（400/404），不产生批次；
+    - 实测频点即使不在可用集合内也如实记录，并在结果中标明异常；
+    - 批次号低于已记录最新批次时拒绝（409 stale_batch）；相同批次号+相同
+      内容的重试返回原结果（200，幂等），相同批次号+不同内容返回冲突（409
+      batch_conflict）；
+    - 核对基于同一份当前占用状态（与发布/占用变更共用场次行锁），结果与占用
+      快照一并固化；后续撤销占用或发布新版本都不改变历史结果。
+    """
+    # 锁场次行：与发布、占用登记/撤销互斥，保证基于一致的当前占用状态
+    session = _load_session(conn, session_id, for_update=True)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(batch_no), 0) FROM measurements "
+            "WHERE session_id = %s", (session_id,))
+        latest_batch = cur.fetchone()[0]
+    if payload.batch_no < latest_batch:
+        raise _measurement_error(
+            409, "stale_batch",
+            "批次号低于已记录的最新批次，请使用更大的批次号",
+            submitted_batch=payload.batch_no,
+            latest_batch=latest_batch)
+
+    # 重复组先于其余校验：重复提交不构成合法内容（同批次重试也不例外）
+    seen: set[int] = set()
+    duplicated: list[int] = []
+    for item in payload.readings:
+        if item.group_id in seen and item.group_id not in duplicated:
+            duplicated.append(item.group_id)
+        seen.add(item.group_id)
+    if duplicated:
+        raise _measurement_error(
+            400, "duplicate_group", "实测频点存在重复设备组",
+            duplicated_groups=sorted(duplicated))
+
+    with conn.cursor() as cur:
+        cur.execute("SELECT id FROM plans WHERE session_id = %s AND version = %s",
+                    (session_id, payload.plan_version))
+        plan_row = cur.fetchone()
+    if plan_row is None:
+        raise _measurement_error(
+            400, "invalid_reference",
+            f"发布版 {payload.plan_version} 不存在",
+            field="plan_version", plan_version=payload.plan_version)
+    plan_id = plan_row[0]
+    plan_assignment = _load_assignments(conn, plan_id)
+    plan_set = set(plan_assignment)
+
+    groups = _load_groups(conn, session_id)
+    current_set = {g["id"] for g in groups}
+    reading_set = {item.group_id for item in payload.readings}
+    if reading_set != plan_set or reading_set != current_set:
+        raise _measurement_error(
+            400, "group_set_mismatch",
+            "实测组集合与发布版组集合或场次当前组集合不一致：漏组、未知组或"
+            "多报均拒绝",
+            missing_from_readings=sorted((plan_set & current_set)
+                                         - reading_set),
+            unknown_groups=sorted(reading_set - current_set),
+            only_in_plan=sorted(plan_set - current_set),
+            only_in_current=sorted(current_set - plan_set))
+
+    fingerprint = {
+        "plan_version": payload.plan_version,
+        "readings": sorted(
+            ({"group_id": item.group_id, "frequency": item.frequency}
+             for item in payload.readings),
+            key=lambda r: r["group_id"]),
+    }
+
+    # 同批次重试：相同内容返回原结果（200），不同内容冲突（409）
+    existing = _load_measurement(conn, session_id, payload.batch_no)
+    if existing is not None:
+        if existing["content_fingerprint"] == fingerprint:
+            response.status_code = 200
+            return _measurement_public(existing)
+        raise _measurement_error(
+            409, "batch_conflict",
+            "相同批次号已提交过不同内容；相同批次+相同内容的重试才会返回原结果",
+            batch_no=payload.batch_no)
+
+    # 判定依据均在本场次行锁内读取：配置、发布版与当前占用为同一份一致快照
+    interferences = _load_interferences(conn, session_id)
+    occupations = _load_occupations(conn, session_id)
+    readings = {item.group_id: item.frequency for item in payload.readings}
+
+    result = analyze_measurement(
+        groups, readings, session["frequencies"], plan_assignment,
+        interferences, occupations)
+    result["available_frequencies"] = session["frequencies"]
+    occupation_snapshot = [
+        {"id": occ["id"], "frequency": occ["frequency"],
+         "start": occ["start"], "end": occ["end"]}
+        for occ in occupations]
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO measurements (session_id, batch_no, plan_version, "
+            "content_fingerprint, occupation_snapshot, result) "
+            "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id, created_at",
+            (session_id, payload.batch_no, payload.plan_version,
+             Json(fingerprint), Json(occupation_snapshot), Json(result)))
+        measurement_id, created_at = cur.fetchone()
+        cur.executemany(
+            "INSERT INTO measurement_readings (measurement_id, group_id, "
+            "frequency) VALUES (%s, %s, %s)",
+            [(measurement_id, gid, freq)
+             for gid, freq in sorted(readings.items())])
+    conn.commit()
+
+    stored = _load_measurement(conn, session_id, payload.batch_no)
+    return _measurement_public(stored)
+
+
+@app.get("/sessions/{session_id}/measurements")
+def list_measurements(session_id: int, conn=Depends(db.get_conn)):
+    """列出场次全部实测批次（按批次号升序），含各自固化的核对结果。"""
+    _load_session(conn, session_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, session_id, batch_no, plan_version, result, "
+            "content_fingerprint, occupation_snapshot, created_at "
+            "FROM measurements WHERE session_id = %s ORDER BY batch_no",
+            (session_id,))
+        rows = cur.fetchall()
+    return [_measurement_public(
+        {"id": r[0], "session_id": r[1], "batch_no": r[2],
+         "plan_version": r[3], "result": r[4],
+         "content_fingerprint": r[5], "occupation_snapshot": r[6],
+         "created_at": r[7]}) for r in rows]
+
+
+@app.get("/sessions/{session_id}/measurements/latest")
+def get_latest_measurement(session_id: int, conn=Depends(db.get_conn)):
+    """读取场次最新实测批次；尚无批次时返回 404。"""
+    _load_session(conn, session_id)
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COALESCE(MAX(batch_no), 0) FROM measurements "
+            "WHERE session_id = %s", (session_id,))
+        latest_batch = cur.fetchone()[0]
+    if latest_batch == 0:
+        raise _measurement_error(404, "measurement_not_found",
+                                 "该场次尚无实测批次")
+    row = _load_measurement(conn, session_id, latest_batch)
+    return _measurement_public(row)
+
+
+@app.get("/sessions/{session_id}/measurements/{batch_no}")
+def get_measurement(session_id: int, batch_no: int,
+                    conn=Depends(db.get_conn)):
+    """读取指定批次号的实测记录与固化核对结果。"""
+    _load_session(conn, session_id)
+    row = _load_measurement(conn, session_id, batch_no)
+    if row is None:
+        raise _measurement_error(
+            404, "measurement_not_found", f"实测批次 {batch_no} 不存在",
+            batch_no=batch_no)
+    return _measurement_public(row)

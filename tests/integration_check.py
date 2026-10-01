@@ -488,6 +488,254 @@ def main() -> int:
         check("占用下路线查询不改动发布版",
               [p["version"] for p in r.json()] == [1, 2], r.text)
 
+        # ---------------------------------------------------------------- #
+        # 现场实测频点批次：留存、核对、幂等、冲突与历史固化
+        # ---------------------------------------------------------------- #
+        r = c.post("/sessions", json={"name": "实测批次演示",
+                                      "frequencies": [1, 2, 3, 4, 5, 6]})
+        mid = r.json()["id"]
+        check("创建实测批次场次", r.status_code == 201, r.text)
+        mg = []
+        for name, s, e in [("音响", 0, 120), ("灯光", 60, 180),
+                           ("返送", 120, 240)]:
+            r = c.post(f"/sessions/{mid}/groups",
+                       json={"name": name, "start": s, "end": e})
+            mg.append(r.json()["id"])
+        m1, m2, m3 = mg
+        c.post(f"/sessions/{mid}/interferences",
+               json={"group_a": m1, "group_b": m2, "min_separation": 3})
+        r = c.post(f"/sessions/{mid}/plans",
+                   json={"base_version": 0, "locks": []})
+        check("实测场次发布 v1", r.status_code == 201, r.text)
+        v1 = {x["group_id"]: x["frequency"]
+              for x in r.json()["assignments"]}
+        check("v1 分配为 (1,4,1)", v1 == {m1: 1, m2: 4, m3: 1}, str(v1))
+
+        def readings(a, b, cc):
+            return [{"group_id": m1, "frequency": a},
+                    {"group_id": m2, "frequency": b},
+                    {"group_id": m3, "frequency": cc}]
+
+        # 批次1：实测与发布版完全一致 -> 201，无任何异常
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 1,
+                         "readings": readings(1, 4, 1)})
+        check("提交实测批次1", r.status_code == 201, r.text)
+        b1 = r.json()
+        check("批次1无偏离/无异常",
+              b1["deviations"] == [] and b1["anomalies"] == []
+              and b1["unavailable_frequencies"] == []
+              and b1["interference_violations"] == []
+              and b1["occupation_conflicts"] == [], str(b1))
+        check("批次1固化空占用快照", b1["occupation_snapshot"] == [])
+        check("批次1留存可用频点", b1["available_frequencies"] == [1, 2, 3, 4, 5, 6])
+
+        # 读取：最新 / 指定批次 / 列表
+        r = c.get(f"/sessions/{mid}/measurements/latest")
+        check("读取最新批次", r.status_code == 200
+              and r.json()["batch_no"] == 1, r.text)
+        r = c.get(f"/sessions/{mid}/measurements/1")
+        check("读取指定批次1", r.status_code == 200
+              and r.json()["id"] == b1["id"], r.text)
+        r = c.get(f"/sessions/{mid}/measurements")
+        check("批次列表", r.status_code == 200
+              and [x["batch_no"] for x in r.json()] == [1], r.text)
+        r = c.get(f"/sessions/{mid}/measurements/99")
+        check("读取不存在批次(404)", r.status_code == 404)
+        r = c.post("/sessions/999999/measurements",
+                   json={"plan_version": 1, "batch_no": 1,
+                         "readings": readings(1, 4, 1)})
+        check("向不存在场次提交实测(404)", r.status_code == 404, r.text)
+
+        # 相同批次+相同内容重试 -> 返回原结果（200，幂等，同一记录）
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 1,
+                         "readings": readings(1, 4, 1)})
+        check("同批次同内容重试 200 幂等",
+              r.status_code == 200 and r.json()["id"] == b1["id"], r.text)
+        # 相同批次+不同内容 -> 409 冲突
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 1,
+                         "readings": readings(2, 4, 1)})
+        check("同批次不同内容冲突(409)", r.status_code == 409
+              and r.json()["detail"]["error"] == "batch_conflict", r.text)
+
+        # 未知发布版 -> 400 invalid_reference
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 99, "batch_no": 2,
+                         "readings": readings(1, 4, 1)})
+        check("未知发布版被拒绝(400)", r.status_code == 400
+              and r.json()["detail"]["error"] == "invalid_reference", r.text)
+        # 漏组 -> 400 group_set_mismatch
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 2,
+                         "readings": [{"group_id": m1, "frequency": 1},
+                                      {"group_id": m2, "frequency": 4}]})
+        check("漏组被拒绝(400)", r.status_code == 400
+              and r.json()["detail"]["error"] == "group_set_mismatch"
+              and r.json()["detail"]["missing_from_readings"] == [m3], r.text)
+        # 未知组 -> 400 group_set_mismatch
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 2,
+                         "readings": readings(1, 4, 1)
+                         + [{"group_id": 999999, "frequency": 1}]})
+        check("未知组被拒绝(400)", r.status_code == 400
+              and r.json()["detail"]["unknown_groups"] == [999999], r.text)
+        # 重复组 -> 400 duplicate_group
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 2,
+                         "readings": [{"group_id": m1, "frequency": 1},
+                                      {"group_id": m1, "frequency": 2},
+                                      {"group_id": m2, "frequency": 4},
+                                      {"group_id": m3, "frequency": 1}]})
+        check("重复组被拒绝(400)", r.status_code == 400
+              and r.json()["detail"]["error"] == "duplicate_group", r.text)
+
+        # 批次2：m1 实测 99（不在可用集合）-> 记录并标明不可用 + 偏离
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 2,
+                         "readings": readings(99, 4, 1)})
+        check("提交批次2(含不可用频点)", r.status_code == 201, r.text)
+        b2 = r.json()
+        check("不可用频点仍留存并标记",
+              b2["unavailable_frequencies"] == [
+                  {"group_id": m1, "frequency": 99}]
+              and any(x["group_id"] == m1 and x["frequency"] == 99
+                      for x in b2["readings"]), str(b2))
+        check("批次2偏离发布版",
+              b2["deviations"] == [{
+                  "group_id": m1, "plan_frequency": 1,
+                  "measured_frequency": 99}], str(b2))
+        check("批次2异常标记", set(b2["anomalies"]) ==
+              {"deviation", "unavailable_frequency"}, str(b2))
+
+        # 登记占用：频点 4 的 [30,150) 与 m1[0,120)、m2[60,180) 都相交
+        r = c.post(f"/sessions/{mid}/occupations",
+                   json={"frequency": 4, "start": 30, "end": 150})
+        check("登记实测占用(频点4)", r.status_code == 201, r.text)
+        mocc = r.json()["id"]
+
+        # 批次5（允许跳号）：m1=m2=4 -> 偏离/间距违规/占用冲突齐全
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 5,
+                         "readings": readings(4, 4, 1)})
+        check("提交批次5(多类异常)", r.status_code == 201, r.text)
+        b5 = r.json()
+        check("批次5偏离组",
+              {d["group_id"] for d in b5["deviations"]} == {m1}, str(b5))
+        check("批次5间距违规",
+              b5["interference_violations"] == [{
+                  "group_a": m1, "group_b": m2, "min_separation": 3,
+                  "frequency_a": 4, "frequency_b": 4,
+                  "actual_separation": 0}], str(b5))
+        check("批次5占用冲突组与占用编号",
+              b5["occupation_conflicts"] == [
+                  {"group_id": m1, "frequency": 4,
+                   "occupation_ids": [mocc]},
+                  {"group_id": m2, "frequency": 4,
+                   "occupation_ids": [mocc]}], str(b5))
+        check("批次5异常标记完整", set(b5["anomalies"]) ==
+              {"deviation", "interference_violation", "occupation_conflict"},
+              str(b5))
+        check("批次5固化占用快照",
+              [o["id"] for o in b5["occupation_snapshot"]] == [mocc], str(b5))
+
+        # 历史固化：撤销占用后，批次5 的冲突结论与快照不变
+        c.delete(f"/sessions/{mid}/occupations/{mocc}")
+        r = c.get(f"/sessions/{mid}/measurements/5")
+        b5b = r.json()
+        check("撤销占用不改变历史批次",
+              b5b["occupation_conflicts"] == b5["occupation_conflicts"]
+              and [o["id"] for o in b5b["occupation_snapshot"]] == [mocc],
+              r.text)
+
+        # 发布新版本 v2（锁 m1=2 -> m1=2,m2=5,m3=1）后，旧批次仍以 v1 为依据
+        r = c.post(f"/sessions/{mid}/plans",
+                   json={"base_version": 1,
+                         "locks": [{"group_id": m1, "frequency": 2}]})
+        check("实测场次发布 v2", r.status_code == 201, r.text)
+        r = c.get(f"/sessions/{mid}/measurements/1")
+        check("新版本发布不改变历史批次依据",
+              r.json()["plan_version"] == 1
+              and r.json()["deviations"] == [], r.text)
+
+        # 新增组 m4 并发布 v3：以旧版 v1 为依据提交（缺 m4）-> 组集合不一致
+        r = c.post(f"/sessions/{mid}/groups",
+                   json={"name": "新组", "start": 0, "end": 300})
+        m4 = r.json()["id"]
+        r = c.post(f"/sessions/{mid}/plans",
+                   json={"base_version": 2, "locks": [
+                       {"group_id": m1, "frequency": 2},
+                       {"group_id": m4, "frequency": 1}]})
+        check("含新组 v3 发布", r.status_code == 201, r.text)
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 1, "batch_no": 6,
+                         "readings": readings(1, 4, 1)
+                         + [{"group_id": m4, "frequency": 1}]})
+        check("组集合与发布版/当前不一致被拒绝(400)",
+              r.status_code == 400
+              and r.json()["detail"]["error"] == "group_set_mismatch"
+              and m4 in r.json()["detail"]["only_in_current"], r.text)
+        # 以 v3 为依据提交完整四组 -> 成功
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 3, "batch_no": 6,
+                         "readings": readings(2, 5, 1)
+                         + [{"group_id": m4, "frequency": 1}]})
+        check("按 v3 当前组集合提交批次6", r.status_code == 201, r.text)
+        check("批次6无异常", r.json()["anomalies"] == [], r.text)
+
+        # 批次号低于最新（6）-> 409 stale_batch（即使 4 从未记录）
+        r = c.post(f"/sessions/{mid}/measurements",
+                   json={"plan_version": 3, "batch_no": 4,
+                         "readings": readings(2, 5, 1)
+                         + [{"group_id": m4, "frequency": 1}]})
+        check("批次号低于最新被拒绝(409)", r.status_code == 409
+              and r.json()["detail"]["error"] == "stale_batch", r.text)
+
+        # 并发：相同批次+相同内容 -> 只有一条记录，其余幂等返回
+        codes, ids = [], []
+
+        def submit_same():
+            rr = c.post(f"/sessions/{mid}/measurements",
+                        json={"plan_version": 3, "batch_no": 7,
+                              "readings": readings(2, 5, 1)
+                              + [{"group_id": m4, "frequency": 1}]})
+            codes.append(("same", rr.status_code))
+            if rr.status_code in (200, 201):
+                ids.append(rr.json()["id"])
+
+        threads = [threading.Thread(target=submit_same) for _ in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("并发同内容：一次创建、其余幂等",
+              sorted(code for _, code in codes) == [200] * 5 + [201]
+              and len(set(ids)) == 1, str(codes))
+
+        # 并发：相同批次+互不相同内容 -> 只有一个成功，其余 409，绝不矛盾
+        codes2 = []
+
+        def submit_diff(i):
+            # 每个线程使用不同频点，保证两两内容不同；频点 7 越界也可受理
+            rr = c.post(f"/sessions/{mid}/measurements",
+                        json={"plan_version": 3, "batch_no": 8,
+                              "readings": readings(2 + i, 5, 1)
+                              + [{"group_id": m4, "frequency": 1}]})
+            codes2.append(rr.status_code)
+
+        threads = [threading.Thread(target=submit_diff, args=(i,))
+                   for i in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        check("并发异内容：仅一条成功其余冲突",
+              codes2.count(201) == 1 and codes2.count(409) == 5, str(codes2))
+        r = c.get(f"/sessions/{mid}/measurements")
+        check("并发后批次无矛盾记录",
+              [x["batch_no"] for x in r.json()] == [1, 2, 5, 6, 7, 8], r.text)
+
         print()
         if _failures:
             print(f"{len(_failures)} 项失败: {_failures}")

@@ -2,7 +2,8 @@
 
 为临时演出的无线电设备组协调频点。录入场次可用的整数频点、设备组使用时段
 （左闭右开）与组间干扰关系（正整数最小频点间距），服务在满足全部约束的前提
-下规划频点分配，并发布为不可变的版本。
+下规划频点分配，并发布为不可变的版本；现场还可留存一次完整实测频点批次，
+核对其与指定发布版及当前约束的差异，并将结果与占用快照固化。
 
 - 时段相交的干扰组，频点间距不小于其最小间距；同组全程只用一个频点；
 - 规划时可锁定部分组的频点；
@@ -17,6 +18,13 @@
 - 占用登记/撤销与发布按场次串行，发布始终基于一份一致的当前占用状态；
 - 起点不早于终点、引用未知组、锁定不可用频点等校验失败均返回 400 并拒绝
   整次操作。
+- **现场实测留存**：现场可提交某场次一次完整实测（指定发布版号、场次内递增
+  批次号与每个设备组的实测整数频点），核对偏离发布版的组、不可用频点、时段
+  相交时违反最小间距的干扰关系、以及与外部占用冲突的组和占用编号；组集合须
+  与发布版及当前组集合一致，未知版本/漏组/重复组一律拒绝；实测频点即使不在
+  可用集合内也如实留存并标明异常。批次号低于已记录最新批次拒绝；相同批次+
+  相同内容重试返回原结果（幂等），内容不同则冲突；**批次结果与占用快照固化，
+  后续撤销占用或发布新版本不改变历史**，可读取最新或指定批次。
 
 ## 一键启动（Docker Compose）
 
@@ -72,6 +80,10 @@ python tests/integration_check.py
   （左闭右开）占用场次某个可用频点；记录编号自增，撤销即删除。设备组时段
   与占用时段相交时该组禁用此频点，端点相接（如组 `[0,60)` 与占用
   `[60,120)`）不算相交。
+- **实测批次（measurement）**：现场一次完整实测的留档，提交后不可变。
+  含核对所依据的发布版号 `plan_version`、场次内递增批次号 `batch_no`
+  （≥1）与每个设备组的实测整数频点；服务一并固化当时的占用快照与核对结果，
+  后续撤销占用或发布新版本都不改变历史批次。
 
 ## API 一览
 
@@ -89,10 +101,15 @@ python tests/integration_check.py
 | GET  | `/sessions/{id}/plans/{version}` | 读取指定发布版分配结果 |
 | GET  | `/sessions/{id}/plans/{version}/diff` | 与前一版的差异 |
 | POST | `/sessions/{id}/retune` | 计算两个发布版之间的逐组切换路线（只读） |
+| POST | `/sessions/{id}/measurements` | 提交一次完整实测频点批次并核对差异（幂等/固化） |
+| GET  | `/sessions/{id}/measurements` | 列出全部实测批次（按批次号升序） |
+| GET  | `/sessions/{id}/measurements/latest` | 读取最新实测批次 |
+| GET  | `/sessions/{id}/measurements/{batch_no}` | 读取指定批次与固化核对结果 |
 
 状态码约定：`201` 创建/发布成功；`400` 校验失败（起点不早于终点、引用未知
-组、锁定不可用频点、占用频点不属于场次、撤销未知占用记录等）；`404` 资源
-不存在；`409` 版本冲突；`422` 约束不可满足（当前发布版不变）。
+组、锁定不可用频点、占用频点不属于场次、撤销未知占用记录、实测未知发布版/
+漏组/重复组等）；`404` 资源不存在；`409` 版本或批次冲突；`422` 约束不可
+满足（当前发布版不变）。实测批次同批次同内容重试返回 `200`（幂等）。
 
 ## 请求示例
 
@@ -367,7 +384,115 @@ curl -s -X POST http://localhost:8000/sessions/1/retune \
 bash examples/demo.sh          # 场次/组/干扰/发布/差异
 bash examples/occupations.sh   # 占用登记、查询、422 与撤销
 bash examples/retune.sh        # 逐组切换路线（只读）
+bash examples/measurements.sh  # 现场实测批次留存与核对
 ```
+
+## 现场实测频点批次
+
+现场人员对某场次完成一次完整实测后，提交**指定发布版号 `plan_version`**、
+**场次内递增批次号 `batch_no`**（≥1）与**每个设备组的实测整数频点**，服务
+在同一场次行锁内基于**同一份当前占用状态**核对，并把结果与占用快照固化。
+
+- **组集合必须一致**：提交的组集合须同时等于指定发布版的组集合与场次当前
+  组集合。未知发布版、漏组、多报/未知组、重复组均返回 `400` 并拒绝整次
+  操作（`detail.error` 分别为 `invalid_reference`、`group_set_mismatch`、
+  `duplicate_group`）；场次不存在返回 `404`；
+- **频点照单全收**：实测频点即使不在场次可用集合内也如实留存，并在
+  `unavailable_frequencies` 中标明，不影响其余核对；
+- **核对结果**（四类，按组号/组号对排序）：
+  - `deviations`：实测频点偏离指定发布版的组（含发布版频点与实测频点）；
+  - `unavailable_frequencies`：实测频点不在场次可用集合内的组；
+  - `interference_violations`：时段相交（左闭右开、端点相接不算）时实测
+    间距小于最小间距的干扰关系（含双方频点与实际间距）；
+  - `occupation_conflicts`：实测频点与外部占用冲突的组，以及**全部**冲突
+    占用的编号 `occupation_ids`（组时段与占用时段相交且频点相同）；
+  - `anomalies`：本次出现的异常类别列表，空列表表示全部正常；
+- **批次号与并发**：`batch_no` 低于已记录最新批次返回 `409 stale_batch`
+  （允许跳号，只要求不回退）；相同批次号 + 相同内容的重试返回原结果，状态
+  码为 `200`（首次提交为 `201`）且记录 `id` 不变；相同批次号 + 不同内容
+  返回 `409 batch_conflict`。并发提交经场次行锁串行化，同批次只会落一条
+  记录，绝不产生相互矛盾的结果；
+- **历史固化**：核对所用的占用状态以 `occupation_snapshot` 随批次保存，
+  后续撤销占用或发布新版本**不改变**任何历史批次；读取始终返回固化结果。
+
+请求体：
+
+| 字段 | 说明 |
+| ---- | ---- |
+| `plan_version` | 核对依据的发布版号（≥1，须属于同一场次） |
+| `batch_no` | 场次内递增批次号（≥1）；低于最新批次拒绝，允许跳号 |
+| `readings` | 每个设备组一项 `{group_id, frequency}`；不得漏组、多报或重复 |
+
+```bash
+# 提交批次：依据发布版 1，批次号 1；三组实测频点
+curl -s -X POST http://localhost:8000/sessions/1/measurements \
+  -H 'Content-Type: application/json' \
+  -d '{"plan_version": 1, "batch_no": 1, "readings": [
+    {"group_id": 1, "frequency": 4},
+    {"group_id": 2, "frequency": 4},
+    {"group_id": 3, "frequency": 1}]}'
+```
+
+成功响应（首次 `201`，同内容重试 `200`）。下例中频点 4 正被一条与组 1、
+组 2 时段相交的外部占用（记录编号 7）占用：
+
+```json
+{
+  "id": 3,
+  "session_id": 1,
+  "batch_no": 1,
+  "plan_version": 1,
+  "readings": [
+    {"group_id": 1, "frequency": 4},
+    {"group_id": 2, "frequency": 4},
+    {"group_id": 3, "frequency": 1}
+  ],
+  "available_frequencies": [1, 2, 3, 4, 5, 6],
+  "deviations": [
+    {"group_id": 1, "plan_frequency": 1, "measured_frequency": 4}
+  ],
+  "unavailable_frequencies": [],
+  "interference_violations": [
+    {"group_a": 1, "group_b": 2, "min_separation": 3,
+     "frequency_a": 4, "frequency_b": 4, "actual_separation": 0}
+  ],
+  "occupation_conflicts": [
+    {"group_id": 1, "frequency": 4, "occupation_ids": [7]},
+    {"group_id": 2, "frequency": 4, "occupation_ids": [7]}
+  ],
+  "anomalies": ["deviation", "interference_violation", "occupation_conflict"],
+  "occupation_snapshot": [
+    {"id": 7, "frequency": 4, "start": 30, "end": 150}
+  ],
+  "created_at": "2026-10-01T02:48:04.200412+00:00"
+}
+```
+
+拒绝与冲突情形：
+
+| 情形 | 状态码 | `detail.error` |
+| ---- | ------ | -------------- |
+| 发布版不存在（未知版本） | 400 | `invalid_reference` |
+| 漏组、多报/未知组，或发布版组集合与当前组集合不一致 | 400 | `group_set_mismatch` |
+| 同一批次提交中出现重复组 | 400 | `duplicate_group` |
+| 场次不存在 | 404 | （`"场次不存在"`） |
+| 批次号低于已记录最新批次 | 409 | `stale_batch` |
+| 相同批次号已提交过不同内容 | 409 | `batch_conflict` |
+| 读取不存在的批次 / 尚无批次时读最新 | 404 | `measurement_not_found` |
+
+`group_set_mismatch` 会给出 `missing_from_readings`（漏报的组）、
+`unknown_groups`（提交中的未知组）、`only_in_plan`/`only_in_current`
+（发布版与当前配置之间的组集合差异），便于现场补全后重报。
+
+```bash
+# 读取：全部批次 / 最新批次 / 指定批次
+curl -s http://localhost:8000/sessions/1/measurements
+curl -s http://localhost:8000/sessions/1/measurements/latest
+curl -s http://localhost:8000/sessions/1/measurements/1
+```
+
+实测留档不影响既有的发布、占用与切换路线行为：它不创建发布版、不改变占用
+状态，只在同一场次行锁下读取一致快照并固化自身结果。
 
 ## 项目结构
 
@@ -377,8 +502,9 @@ app/main.py    HTTP API 与发布事务（行锁串行化并发发布与占用�
 app/solver.py  回溯 + 前向检查求解器（含占用禁用频点）；无解时给出不可约的
                锁定/干扰/占用核心
 app/retune.py  逐组切换路线：连通分量分解 + 限深 BFS（最少步数、字典序最小）
+app/measurement.py  实测批次核对（偏离发布版/不可用频点/间距违规/占用冲突）
 app/db.py      连接池、启动重试与 schema 初始化
-schema.sql     表结构（应用启动时幂等执行；occupations 为本轮新增）
-tests/         求解器单元测试与端到端集成检查
+schema.sql     表结构（应用启动时幂等执行；occupations/measurements 为本轮新增）
+tests/         求解器与实测核对单元测试、端到端集成检查
 examples/      curl 请求示例
 ```
